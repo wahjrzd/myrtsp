@@ -25,29 +25,35 @@ const (
 )
 
 type RtspClient struct {
-	CSeq            uint32
-	BaseUrl         string
-	Host            string
-	Port            uint16
-	vRTPChannel     int
-	vRTCPChannel    int
-	UserAgent       string
-	Conn            net.Conn
-	ConnRW          *bufio.ReadWriter
-	auth            *DigestAuth
-	Protocol        ProtocolName
-	SessionId       string
-	Scale           float32
-	Speed           float32
-	StartTime       float32
-	EndTime         float32
-	CurrentCmd      string
-	ControlPath     string
-	rtp             *RTPunpacket
-	RawDataCallback func([]byte, uint32, byte, interface{})
-	RawDataUser     interface{}
-	RTPDataCallback func([]byte, interface{})
-	RTPDataUser     interface{}
+	CSeq             uint32
+	BaseUrl          string
+	Host             string
+	Port             uint16
+	vRTPChannel      int
+	vRTCPChannel     int
+	aRTPChannel      int
+	aRTCPChannel     int
+	UserAgent        string
+	Conn             net.Conn
+	ConnRW           *bufio.ReadWriter
+	auth             *DigestAuth
+	Protocol         ProtocolName
+	SessionId        string
+	Scale            float32
+	Speed            float32
+	StartTime        float32
+	EndTime          float32
+	CurrentCmd       string
+	VideoControlPath string
+	AudioControlPath string
+	rtp              *RTPunpacket
+	RTPDataCallback  func([]byte, interface{})
+	RTPDataUser      interface{}
+	HasVideo         bool
+	SendVideoSteup   bool
+	HasAudio         bool
+	SendAudioSetup   bool
+	HasQuit          chan int
 }
 
 func NewRtspClient(rawUrl string, id string) *RtspClient {
@@ -76,6 +82,8 @@ func NewRtspClient(rawUrl string, id string) *RtspClient {
 		Port:            uint16(port),
 		vRTPChannel:     0,
 		vRTCPChannel:    1,
+		aRTPChannel:     2,
+		aRTCPChannel:    3,
 		UserAgent:       "User-Agent: Simple RTSP Client\r\n",
 		Protocol:        TCP,
 		Scale:           1.0,
@@ -83,21 +91,27 @@ func NewRtspClient(rawUrl string, id string) *RtspClient {
 		StartTime:       0.0,
 		EndTime:         -1.0,
 		CurrentCmd:      "DESCRIBE",
-		rtp:             nil,
-		RawDataCallback: nil,
+		rtp:             NewRTPUnpacket(),
 		RTPDataCallback: nil,
+		HasVideo:        false,
+		SendVideoSteup:  false,
+		HasAudio:        false,
+		SendAudioSetup:  false,
+		HasQuit:         make(chan int),
 	}
 }
 
 func (cli *RtspClient) OpenStream() int {
+	defer cli.SetQuit()
 	addr := fmt.Sprintf("%s:%d", cli.Host, cli.Port)
 	conn, err := net.DialTimeout("tcp", addr, time.Second*3)
 	if err != nil {
 		log.Println(err)
 		return 1
 	}
+	cli.Conn = conn
 	cli.ConnRW = bufio.NewReadWriter(bufio.NewReaderSize(conn, 204800), bufio.NewWriterSize(conn, 204800))
-	cli.sendRequest(cli.CurrentCmd)
+	cli.sendRequest(cli.CurrentCmd, cli.BaseUrl, 0, 1)
 	buf1 := make([]byte, 1)
 	buf2 := make([]byte, 2)
 	for {
@@ -125,10 +139,11 @@ func (cli *RtspClient) OpenStream() int {
 			if int(buf1[0]) == cli.vRTCPChannel {
 
 			} else if int(buf1[0]) == cli.vRTPChannel {
-				if cli.RTPDataCallback != nil {
-					cli.RTPDataCallback(data, cli.RTPDataUser)
-				}
-				cli.rtp.InputRTPData(data)
+				cli.rtp.InputRTPData(data, "video")
+			} else if int(buf1[0]) == cli.aRTPChannel {
+				//cli.rtp.InputRTPData(data, "audio")
+			} else if int(buf1[0]) == cli.aRTCPChannel {
+
 			}
 		} else {
 			buf := bytes.NewBuffer(nil)
@@ -155,7 +170,7 @@ func (cli *RtspClient) OpenStream() int {
 								realm, nonce := parseWWWAuth(authStr)
 								cli.auth.Realm = realm
 								cli.auth.Nonce = nonce
-								cli.sendRequest(cli.CurrentCmd)
+								cli.sendRequest(cli.CurrentCmd, cli.BaseUrl, 0, 1)
 							} else {
 								log.Println("return 401 but not www-auth info")
 								return 1
@@ -186,18 +201,23 @@ func (cli *RtspClient) OpenStream() int {
 								for _, v := range sdpMsg.Medias {
 									switch v.Description.Type {
 									case "video":
-										cli.ControlPath = v.Attribute("control")
-										rtpmap := v.Attribute("rtpmap")
-										payloadType, _ := strconv.Atoi(strings.Split(rtpmap, " ")[0])
+										cli.VideoControlPath = v.Attribute("control")
+										rtpmap := v.Attribute("rtpmap") //96 H264/90000
+										//payloadType, _ := strconv.Atoi(strings.Split(rtpmap, " ")[0])
+										cli.HasVideo = true
+
 										if strings.Contains(rtpmap, "H265") {
-											cli.rtp = NewRTPUnpacket(byte(payloadType), "H265", cli.unpacketcb)
+											cli.rtp.SetVideoCodecType("H265")
 										} else if strings.Contains(rtpmap, "H264") {
-											cli.rtp = NewRTPUnpacket(byte(payloadType), "H264", cli.unpacketcb)
+											cli.rtp.SetVideoCodecType("H264")
 										} else {
 											log.Println(rtpmap)
 										}
 										//
 									case "audio":
+										cli.AudioControlPath = v.Attribute("control")
+										_ = v.Attribute("rtpmap") //0 PCMU/8000
+										cli.HasAudio = true
 									}
 								}
 							}
@@ -210,10 +230,39 @@ func (cli *RtspClient) OpenStream() int {
 							}
 							if cli.CurrentCmd == "DESCRIBE" {
 								cli.CurrentCmd = "SETUP"
-								cli.sendRequest(cli.CurrentCmd)
+								tempUri := cli.BaseUrl
+								if cli.VideoControlPath != "" {
+									if strings.HasSuffix(tempUri, "/") == false {
+										tempUri += "/"
+									}
+									if strings.HasPrefix(cli.VideoControlPath, "rtsp://") {
+										tempUri = cli.VideoControlPath
+									} else {
+										tempUri += cli.VideoControlPath
+									}
+								}
+								cli.sendRequest(cli.CurrentCmd, tempUri, cli.vRTPChannel, cli.vRTCPChannel)
+								cli.SendVideoSteup = true
 							} else if cli.CurrentCmd == "SETUP" {
-								cli.CurrentCmd = "PLAY"
-								cli.sendRequest(cli.CurrentCmd)
+								if cli.HasAudio && cli.SendAudioSetup == false {
+									tempUri := cli.BaseUrl
+									if cli.AudioControlPath != "" {
+										if strings.HasSuffix(tempUri, "/") == false {
+											tempUri += "/"
+										}
+										if strings.HasPrefix(cli.AudioControlPath, "rtsp://") {
+											tempUri = cli.AudioControlPath
+										} else {
+											tempUri += cli.AudioControlPath
+										}
+									}
+									cli.sendRequest(cli.CurrentCmd, tempUri, cli.aRTPChannel, cli.aRTCPChannel)
+									cli.SendAudioSetup = true
+								} else {
+									cli.CurrentCmd = "PLAY"
+									cli.sendRequest(cli.CurrentCmd, cli.BaseUrl, 0, 1)
+								}
+
 							}
 						} else {
 							/*TODO*/
@@ -222,35 +271,23 @@ func (cli *RtspClient) OpenStream() int {
 					}
 				}
 			}
+
+			if cli.CurrentCmd == "TEARDOWN" {
+				break
+			}
 		}
 	}
 	return 0
 }
 
-func (cli *RtspClient) sendRequest(cmd string) {
+func (cli *RtspClient) sendRequest(cmd string, url string, a int, b int) {
 	cli.CSeq++
 	extraHeaders := bytes.NewBuffer(nil)
 	authenticatorStr := cli.auth.CreateAuthenticatorString(cmd, cli.BaseUrl)
-	var reqHeader string
-	if cmd == "SETUP" {
-		tempURI := cli.BaseUrl
-		if cli.ControlPath != "" {
-			if strings.HasSuffix(cli.BaseUrl, "/") == false {
-				tempURI += "/"
-			}
-			tempURI += cli.ControlPath
-		}
-
-		reqHeader = fmt.Sprintf("%s %s RTSP/1.0\r\n"+
-			"CSeq: %d\r\n"+
-			"%s"+
-			"%s", cmd, tempURI, cli.CSeq, authenticatorStr, cli.UserAgent)
-	} else {
-		reqHeader = fmt.Sprintf("%s %s RTSP/1.0\r\n"+
-			"CSeq: %d\r\n"+
-			"%s"+
-			"%s", cmd, cli.BaseUrl, cli.CSeq, authenticatorStr, cli.UserAgent)
-	}
+	var reqHeader string = fmt.Sprintf("%s %s RTSP/1.0\r\n"+
+		"CSeq: %d\r\n"+
+		"%s"+
+		"%s", cmd, url, cli.CSeq, authenticatorStr, cli.UserAgent)
 
 	extraHeaders.WriteString(reqHeader)
 
@@ -258,8 +295,12 @@ func (cli *RtspClient) sendRequest(cmd string) {
 		extraHeaders.WriteString("Accept: application/sdp\r\n")
 	} else if cmd == "SETUP" {
 		if cli.Protocol == TCP {
-			transport := fmt.Sprintf("Transport: RTP/AVP/TCP;unicast;interleaved=%d-%d\r\n", cli.vRTPChannel, cli.vRTCPChannel)
+			transport := fmt.Sprintf("Transport: RTP/AVP/TCP;unicast;interleaved=%d-%d\r\n", a, b)
 			extraHeaders.WriteString(transport)
+			if cli.SessionId != "" {
+				sessionStr := fmt.Sprintf("Session: %s\r\n", cli.SessionId)
+				extraHeaders.WriteString(sessionStr)
+			}
 		} else {
 			if true { /*多播*/
 				//_ := fmt.Sprintf("Transport: RAW/RAW/;multicast;port=%d-%d\r\n", cli.vRTPChannel, cli.vRTCPChannel)
@@ -304,12 +345,15 @@ func (cli *RtspClient) sendRequest(cmd string) {
 }
 
 func (cli *RtspClient) StopStream() {
+	cli.CurrentCmd = "TEARDOWN"
+	cli.sendRequest(cli.CurrentCmd, cli.BaseUrl, 0, 1)
+	_ = <-cli.HasQuit
+
 	cli.Conn.Close()
 }
 
-func (cli *RtspClient) SetRawDataCallback(cb func([]byte, uint32, byte, interface{}), arg interface{}) {
-	cli.RawDataCallback = cb
-	cli.RawDataUser = arg
+func (cli *RtspClient) SetRawDataCallback(cb FrameCallback, arg interface{}) {
+	cli.rtp.SetCallback(cb, arg)
 }
 
 func (cli *RtspClient) SetRTPDataCallback(cb func([]byte, interface{}), arg interface{}) {
@@ -317,9 +361,6 @@ func (cli *RtspClient) SetRTPDataCallback(cb func([]byte, interface{}), arg inte
 	cli.RTPDataUser = arg
 }
 
-func (cli *RtspClient) unpacketcb(data []byte, pts uint32, frameType byte) {
-	if cli.RawDataCallback != nil {
-		cli.RawDataCallback(data, pts, frameType, cli.RawDataUser)
-	}
-	//fmt.Printf("frame size:%d,pts:%d\n", len(data), pts)
+func (cli *RtspClient) SetQuit() {
+	cli.HasQuit <- 1
 }

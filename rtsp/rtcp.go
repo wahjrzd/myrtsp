@@ -4,7 +4,7 @@ package rtsp
 import (
 	"bytes"
 	"encoding/binary"
-	"fmt"
+	//"fmt"
 	"math/rand"
 	"os"
 )

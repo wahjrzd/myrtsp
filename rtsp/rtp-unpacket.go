@@ -20,24 +20,39 @@ const (
 	HEVC_NAL_SEI_SUFFIX                 = 40
 )
 
-type RTPunpacket struct {
-	PayloadType   byte
-	CodecType     string
-	frameBuffer   *bytes.Buffer
-	NALUHeader    [2]byte
-	FrameCallback func([]byte, uint32, byte)
+type FrameInfo struct {
+	MediaType string
+	FrameType uint8
+	Data      []byte
+	TimeStamp uint32
 }
 
-func NewRTPUnpacket(pt byte, codec string, cb func([]byte, uint32, byte)) *RTPunpacket {
+type FrameCallback func(*FrameInfo, interface{})
+
+type RTPunpacket struct {
+	PayloadType    byte
+	VideoCodecType string
+	frameBuffer    *bytes.Buffer
+	NALUHeader     [2]byte
+	Pts            uint32
+	NALUType       uint8
+	RawCallback    FrameCallback
+	Arg            interface{}
+}
+
+func NewRTPUnpacket() *RTPunpacket {
 	return &RTPunpacket{
-		PayloadType:   pt,
-		CodecType:     codec,
-		frameBuffer:   bytes.NewBuffer(nil),
-		FrameCallback: cb,
+		PayloadType:    96,
+		VideoCodecType: "H264",
+		Pts:            0,
+		NALUType:       0,
+		frameBuffer:    bytes.NewBuffer(nil),
+		RawCallback:    nil,
+		Arg:            nil,
 	}
 }
 
-func (r *RTPunpacket) InputRTPData(data []byte) {
+func (r *RTPunpacket) InputRTPData(data []byte, mediaType string) {
 	if data == nil || len(data) <= 12 {
 		fmt.Println("rtp is nil or rtp is to small")
 		return
@@ -55,20 +70,36 @@ func (r *RTPunpacket) InputRTPData(data []byte) {
 	// ssrc := binary.BigEndian.Uint32(data[8:])
 
 	//fmt.Printf("Mark:%d,PT:%d,Seq:%d,Time:%d,SSCR:%d\n", mark, pt, seq, tm, ssrc)
-	var t byte = 0
-	if r.CodecType == "H264" {
-		t = r.parseAVCRTP(data[12:])
-	} else if r.CodecType == "H265" {
+
+	if r.Pts == 0 {
+		r.Pts = tm
+	}
+
+	if r.Pts != tm {
+		if r.RawCallback != nil {
+			f := FrameInfo{
+				MediaType: "video",
+				FrameType: r.NALUType,
+				TimeStamp: tm / 90,
+			}
+			f.Data = make([]byte, r.frameBuffer.Len())
+			copy(f.Data, r.frameBuffer.Bytes())
+			r.RawCallback(&f, r.Arg)
+		}
+		r.Pts = tm
+		r.frameBuffer.Reset()
+	}
+
+	if r.VideoCodecType == "H264" {
+		r.parseAVCRTP(data[12:])
+	} else if r.VideoCodecType == "H265" {
 		r.parseHEVCRTP(data[12:])
 	} else {
 		fmt.Println("unknown codecType")
 	}
 
 	if mark == 1 {
-		if r.FrameCallback != nil {
-			r.FrameCallback(r.frameBuffer.Bytes(), tm, t)
-		}
-		r.frameBuffer.Reset()
+
 	}
 }
 
@@ -98,7 +129,7 @@ func (r *RTPunpacket) parseHEVCRTP(data []byte) {
 	}
 }
 
-func (r *RTPunpacket) parseAVCRTP(data []byte) byte {
+func (r *RTPunpacket) parseAVCRTP(data []byte) {
 	if (data[0] & 0x1c) == 0x1c { /*FUA*/
 		se := data[1] >> 6
 		if se == 2 { /*s bit*/
@@ -107,15 +138,26 @@ func (r *RTPunpacket) parseAVCRTP(data []byte) byte {
 			r.frameBuffer.Write(NAL4[:])
 			r.frameBuffer.WriteByte(r.NALUHeader[0])
 			r.frameBuffer.Write(data[2:])
+
+			r.NALUType = data[1] & 0x1F
 		} else if se != 3 { /*e or 0 bit*/
 			r.frameBuffer.Write(data[2:])
 		} else {
 			fmt.Println("avc rtp packet error")
 		}
-		return data[1] & 0x1F
+
 	} else {
 		r.frameBuffer.Write(NAL4[:])
 		r.frameBuffer.Write(data)
-		return data[0] & 0x1F
+		r.NALUType = data[0] & 0x1F
 	}
+}
+
+func (r *RTPunpacket) SetCallback(cb FrameCallback, arg interface{}) {
+	r.RawCallback = cb
+	r.Arg = arg
+}
+
+func (r *RTPunpacket) SetVideoCodecType(codec string) {
+	r.VideoCodecType = codec
 }
